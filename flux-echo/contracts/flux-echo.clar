@@ -18,6 +18,7 @@
 (define-constant ERR-INVALID-BATCH-SIZE (err u1013))
 (define-constant ERR-OPERATION-FAILED (err u1014))
 (define-constant ERR-INVALID-SIGNATURE (err u1015))
+(define-constant ERR-INSUFFICIENT-BALANCE (err u1016))
 
 ;; Contract Constants
 (define-constant CONTRACT-OWNER tx-sender)
@@ -318,4 +319,206 @@
               (unlock-block (+ block-height lock-duration))
               (wisdom-amount (* amount (/ lock-duration MIN-LOCK-PERIOD))))
             
-            (asserts! (>= user-echo amount) ER
+            (asserts! (>= user-echo amount) ERR-INSUFFICIENT-BALANCE)
+            
+            ;; Lock Echo tokens
+            (map-set user-echo-balance tx-sender (- user-echo amount))
+            (map-set user-lock-periods tx-sender {
+                amount: amount,
+                unlock-block: unlock-block,
+                lock-duration: lock-duration
+            })
+            
+            ;; Mint Wisdom tokens
+            (map-set user-wisdom-balance tx-sender 
+                (+ (default-to u0 (map-get? user-wisdom-balance tx-sender)) wisdom-amount))
+            (var-set total-wisdom-supply (+ (var-get total-wisdom-supply) wisdom-amount))
+            (update-cooldown tx-sender)
+            
+            ;; Log event
+            (log-event "lock-for-wisdom" tx-sender amount "echo-locked")
+            (ok wisdom-amount))))
+
+(define-public (unlock-echo)
+    (begin
+        (try! (check-governance-not-paused))
+        (let ((lock-data (map-get? user-lock-periods tx-sender)))
+            (match lock-data
+                data (begin
+                    (asserts! (>= block-height (get unlock-block data)) ERR-LOCK-PERIOD-INVALID)
+                    
+                    ;; Calculate wisdom to burn (proportional to remaining time)
+                    (let ((locked-amount (get amount data))
+                          (wisdom-to-burn (/ (* locked-amount (get lock-duration data)) MIN-LOCK-PERIOD))
+                          (user-wisdom (default-to u0 (map-get? user-wisdom-balance tx-sender))))
+                        
+                        ;; Burn wisdom tokens
+                        (if (>= user-wisdom wisdom-to-burn)
+                            (map-set user-wisdom-balance tx-sender (- user-wisdom wisdom-to-burn))
+                            (map-set user-wisdom-balance tx-sender u0))
+                        
+                        ;; Return Echo tokens
+                        (map-set user-echo-balance tx-sender 
+                            (+ (default-to u0 (map-get? user-echo-balance tx-sender)) locked-amount))
+                        
+                        ;; Clear lock period
+                        (map-delete user-lock-periods tx-sender)
+                        
+                        ;; Update supplies
+                        (var-set total-wisdom-supply 
+                            (if (>= (var-get total-wisdom-supply) wisdom-to-burn)
+                                (- (var-get total-wisdom-supply) wisdom-to-burn)
+                                u0))
+                        
+                        ;; Log event
+                        (log-event "unlock-echo" tx-sender locked-amount "echo-unlocked")
+                        (ok locked-amount)))
+                ERR-INVALID-AMOUNT))))
+
+(define-public (withdraw (amount uint))
+    (begin
+        (try! (check-governance-not-paused))
+        (try! (check-cooldown tx-sender))
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        
+        (let ((user-flux (default-to u0 (map-get? user-flux-balance tx-sender)))
+              (fee-amount (/ (* amount (get-user-fee-rate tx-sender)) BASIS-POINTS))
+              (withdrawal-amount (- amount fee-amount)))
+            
+            (asserts! (>= user-flux amount) ERR-INSUFFICIENT-BALANCE)
+            
+            ;; Update balances
+            (map-set user-flux-balance tx-sender (- user-flux amount))
+            (var-set total-flux-supply (- (var-get total-flux-supply) amount))
+            (var-set total-fees-collected (+ (var-get total-fees-collected) fee-amount))
+            (update-cooldown tx-sender)
+            
+            ;; Log event
+            (log-event "withdrawal" tx-sender amount "flux-burned")
+            (ok withdrawal-amount))))
+
+(define-public (claim-reputation-rewards)
+    (begin
+        (try! (check-governance-not-paused))
+        
+        (let ((last-claim (default-to u0 (map-get? user-last-claim-block tx-sender)))
+              (blocks-since-claim (- block-height last-claim))
+              (base-reputation (calculate-user-reputation tx-sender blocks-since-claim))
+              (final-reputation (apply-expertise-boost base-reputation tx-sender)))
+            
+            (asserts! (> blocks-since-claim u0) ERR-INVALID-AMOUNT)
+            
+            ;; Update reputation
+            (map-set user-reputation-earned tx-sender 
+                (+ (default-to u0 (map-get? user-reputation-earned tx-sender)) final-reputation))
+            (map-set user-last-claim-block tx-sender block-height)
+            
+            ;; Award Echo tokens based on reputation
+            (let ((echo-reward (/ final-reputation u100)))
+                (map-set user-echo-balance tx-sender 
+                    (+ (default-to u0 (map-get? user-echo-balance tx-sender)) echo-reward))
+                (var-set total-echo-supply (+ (var-get total-echo-supply) echo-reward)))
+            
+            ;; Log event
+            (log-event "reputation-claimed" tx-sender final-reputation "echo-awarded")
+            (ok final-reputation))))
+
+(define-public (vote-on-proposal (proposal-id uint) (vote-weight uint) (support bool))
+    (begin
+        (try! (check-governance-not-paused))
+        (try! (check-cooldown tx-sender))
+        
+        (let ((current-voting-power (default-to u0 (map-get? user-voting-power tx-sender)))
+              (user-wisdom (default-to u0 (map-get? user-wisdom-balance tx-sender))))
+            
+            (asserts! (> current-voting-power u0) ERR-INSUFFICIENT-REPUTATION)
+            (asserts! (<= vote-weight current-voting-power) ERR-INVALID-AMOUNT)
+            
+            ;; Enhanced voting power for Wisdom holders
+            (let ((effective-vote-weight (if (> user-wisdom u0)
+                                            (+ vote-weight (/ vote-weight u2)) ;; 50% boost
+                                            vote-weight)))
+                
+                (update-cooldown tx-sender)
+                ;; Log vote
+                (log-event "vote-cast" tx-sender effective-vote-weight 
+                    (if support "support" "oppose"))
+                (ok effective-vote-weight)))))
+
+(define-public (batch-process-deposits (amounts (list 50 uint)) (users (list 50 principal)))
+    (begin
+        (asserts! (is-admin) ERR-NOT-AUTHORIZED)
+        (try! (check-governance-not-paused))
+        (asserts! (is-eq (len amounts) (len users)) ERR-INVALID-BATCH-SIZE)
+        (asserts! (<= (len amounts) MAX-BATCH-SIZE) ERR-INVALID-BATCH-SIZE)
+        
+        (let ((batch-id (var-get batch-counter)))
+            (var-set batch-counter (+ batch-id u1))
+            (map-set batch-operations batch-id {
+                operator: tx-sender,
+                operation-type: "batch-deposit",
+                total-amount: (fold + amounts u0),
+                processed-count: (len amounts),
+                status: "completed"
+            })
+            
+            ;; Log batch operation
+            (log-event "batch-operation" tx-sender (fold + amounts u0) "deposits-processed")
+            (ok batch-id))))
+
+;; Read-only Functions
+(define-read-only (get-user-balance (user principal))
+    {
+        flux: (default-to u0 (map-get? user-flux-balance user)),
+        echo: (default-to u0 (map-get? user-echo-balance user)),
+        wisdom: (default-to u0 (map-get? user-wisdom-balance user)),
+        voting-power: (default-to u0 (map-get? user-voting-power user)),
+        reputation: (default-to u0 (map-get? user-reputation-earned user))
+    })
+
+(define-read-only (get-committee-info (committee-id uint))
+    (map-get? supported-committees committee-id))
+
+(define-read-only (get-governance-status)
+    {
+        paused: (var-get governance-paused),
+        total-flux: (var-get total-flux-supply),
+        total-echo: (var-get total-echo-supply),
+        total-wisdom: (var-get total-wisdom-supply),
+        emergency-votes: (var-get emergency-pause-votes),
+        last-rebalance: (var-get last-rebalance-block),
+        version: (var-get governance-version)
+    })
+
+(define-read-only (get-user-lock-info (user principal))
+    (map-get? user-lock-periods user))
+
+(define-read-only (calculate-potential-wisdom (echo-amount uint) (lock-duration uint))
+    (begin
+        (asserts! (>= lock-duration MIN-LOCK-PERIOD) ERR-LOCK-PERIOD-INVALID)
+        (asserts! (<= lock-duration MAX-LOCK-PERIOD) ERR-LOCK-PERIOD-INVALID)
+        (ok (* echo-amount (/ lock-duration MIN-LOCK-PERIOD)))))
+
+(define-read-only (get-bridge-info (skill (string-ascii 16)))
+    (map-get? skill-bridges skill))
+
+(define-read-only (get-event-log (event-id uint))
+    (map-get? event-logs event-id))
+
+(define-read-only (get-total-supply-info)
+    {
+        flux: (var-get total-flux-supply),
+        echo: (var-get total-echo-supply),
+        wisdom: (var-get total-wisdom-supply),
+        consensus-fund: (var-get consensus-fund-balance)
+    })
+
+;; Initialize contract (called once upon deployment)
+(define-private (initialize-contract)
+    (begin
+        (initialize-security-params)
+        (var-set last-rebalance-block block-height)
+        true))
+
+;; Contract initialization
+(initialize-contract)
